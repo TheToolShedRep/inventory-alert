@@ -37,6 +37,18 @@ function prettifyText(input = "") {
     );
 }
 
+// Compare if timestamp string is same UTC calendar day as refDate
+function isSameUTCDay(timestamp, refDate = new Date()) {
+  const d = new Date(timestamp);
+  if (Number.isNaN(d.getTime())) return false;
+
+  return (
+    d.getUTCFullYear() === refDate.getUTCFullYear() &&
+    d.getUTCMonth() === refDate.getUTCMonth() &&
+    d.getUTCDate() === refDate.getUTCDate()
+  );
+}
+
 // ---------------- Google Sheets helper ----------------
 
 let sheetsClient = null;
@@ -86,7 +98,7 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A:F", // adjust if your tab name is different
+      range: "Table1!A:F", // 👈 tab name updated (Timestamp, Item, Qty, Location, IP, User Agent)
       valueInputOption: "USER_ENTERED",
       requestBody: { values },
     });
@@ -105,7 +117,7 @@ async function getRecentAlertsFromSheet(limit = 50) {
 
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A:F",
+      range: "Table1!A:F", // 👈 tab name updated here too
     });
 
     const rows = res.data.values || [];
@@ -113,24 +125,26 @@ async function getRecentAlertsFromSheet(limit = 50) {
 
     // If the first row is your header row, you can skip it:
     // const dataRows = rows.slice(1);
-    const dataRows = rows; // assuming no header row yet
+    const dataRows = rows; // using all rows, assuming your header is part of the data
 
     // Take the last `limit` rows (most recent at the bottom)
     const recent = dataRows.slice(-limit);
 
     // Map to objects
-    return recent.map(r => {
-      const [
-        timestamp = "",
-        item = "",
-        qty = "",
-        location = "",
-        ip = "",
-        userAgent = "",
-      ] = r;
+    return recent
+      .map(r => {
+        const [
+          timestamp = "",
+          item = "",
+          qty = "",
+          location = "",
+          ip = "",
+          userAgent = "",
+        ] = r;
 
-      return { timestamp, item, qty, location, ip, userAgent };
-    }).reverse(); // latest first
+        return { timestamp, item, qty, location, ip, userAgent };
+      })
+      .reverse(); // latest first
   } catch (err) {
     console.error("❌ Error reading alerts from Google Sheets:", err.message);
     return [];
@@ -292,6 +306,7 @@ app.get("/alert", async (req, res) => {
 
 app.get("/manager", async (req, res) => {
   const providedKey = req.query.key || "";
+  const rangeParam = (req.query.range || "today").toLowerCase(); // "today" | "all"
 
   if (!MANAGER_KEY) {
     return res
@@ -350,7 +365,25 @@ app.get("/manager", async (req, res) => {
   }
 
   try {
-    const alerts = await getRecentAlertsFromSheet(50);
+    let alerts = await getRecentAlertsFromSheet(50);
+
+    const now = new Date();
+    let subtitle;
+    let toggleLink;
+
+    if (rangeParam === "all") {
+      subtitle = "Showing all recent alerts.";
+      toggleLink = `<a href="/manager?key=${encodeURIComponent(
+        providedKey
+      )}&range=today">View today only</a>`;
+    } else {
+      // default: today
+      alerts = alerts.filter(a => isSameUTCDay(a.timestamp, now));
+      subtitle = "Showing alerts from today.";
+      toggleLink = `<a href="/manager?key=${encodeURIComponent(
+        providedKey
+      )}&range=all">View all</a>`;
+    }
 
     const rowsHtml = alerts
       .map(a => {
@@ -390,16 +423,17 @@ app.get("/manager", async (req, res) => {
           }
           h1 {
             font-size: 22px;
-            margin-bottom: 8px;
+            margin-bottom: 4px;
           }
           p {
             font-size: 14px;
             color: #9ca3af;
             margin-top: 0;
-            margin-bottom: 16px;
+            margin-bottom: 8px;
           }
           .table-wrapper {
             overflow-x: auto;
+            margin-top: 12px;
           }
           table {
             width: 100%;
@@ -425,18 +459,18 @@ app.get("/manager", async (req, res) => {
           tr:nth-child(even) td {
             background: #030712;
           }
-          .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-size: 11px;
-            background: #1e293b;
+          a {
+            color: #60a5fa;
+            text-decoration: none;
+          }
+          a:hover {
+            text-decoration: underline;
           }
         </style>
       </head>
       <body>
         <h1>Inventory Alerts – Manager View</h1>
-        <p>Showing the most recent alerts from staff. This reads directly from the live log.</p>
+        <p>${subtitle} &nbsp; ${toggleLink}</p>
         <div class="table-wrapper">
           <table>
             <thead>
@@ -450,7 +484,10 @@ app.get("/manager", async (req, res) => {
               </tr>
             </thead>
             <tbody>
-              ${rowsHtml || '<tr><td colspan="6">No alerts logged yet.</td></tr>'}
+              ${
+                rowsHtml ||
+                '<tr><td colspan="6">No alerts for the selected range.</td></tr>'
+              }
             </tbody>
           </table>
         </div>
