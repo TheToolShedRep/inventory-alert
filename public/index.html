@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Café Bartique Inventory Alerts</title>
+  </head>
+  <body>
+    <h1>Café Bartique Inventory Alerts</h1>
+    <p>
+      Click the button below on each device that should receive low-inventory
+      alerts.
+    </p>
+
+    <button id="enable-btn">Enable Notifications</button>
+
+    <pre id="log"></pre>
+
+    <!-- OneSignal SDK -->
+    <script src="https://cdn.onesignal.com/sdks/OneSignalSDK.js" async></script>
+
+    <script>
+      const logEl = document.getElementById("log");
+      function log(msg) {
+        console.log(msg);
+        logEl.textContent += msg + "\n";
+      }
+
+      // Replace this with your real app ID
+      const ONESIGNAL_APP_ID = "81d9cfde-7c59-4527-a003-1716bcbb2bff"; // <-- your App ID here
+
+      window.OneSignal = window.OneSignal || [];
+      OneSignal.push(function () {
+        log("Initializing OneSignal…");
+
+        OneSignal.init({
+          appId: ONESIGNAL_APP_ID,
+          notifyButton: { enable: false },
+        });
+
+        log("OneSignal.init() called");
+      });
+
+      // Show current permission on load
+      log("Notification.permission = " + Notification.permission);
+
+      document
+        .getElementById("enable-btn")
+        .addEventListener("click", function () {
+          log("Enable Notifications button clicked.");
+
+          OneSignal.push(async function () {
+            try {
+              const state = await OneSignal.getNotificationPermission();
+              log("OneSignal permission state before request: " + state);
+
+              if (state === "default") {
+                log(
+                  "Requesting permission via OneSignal.registerForPushNotifications()"
+                );
+                await OneSignal.registerForPushNotifications();
+              } else {
+                log("Permission already " + state);
+              }
+
+              const after = await OneSignal.getNotificationPermission();
+              log("OneSignal permission state after request: " + after);
+            } catch (e) {
+              log("Error while requesting permission: " + e.message);
+            }
+          });
+        });
+    </script>
+  </body>
+</html>
