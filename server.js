@@ -146,7 +146,7 @@ app.get("/alert", async (req, res) => {
         .trim() || req.ip || "";
     const userAgent = req.headers["user-agent"] || "";
 
-    await logAlertToSheet({
+        await logAlertToSheet({
       item: itemPretty,
       qty: qtyPretty,
       location: locationPretty,
@@ -154,16 +154,93 @@ app.get("/alert", async (req, res) => {
       userAgent,
     });
 
-    if (isRateLimited) {
-      res.send("Alert logged (cooldown active, notification skipped).");
-    } else {
-      res.send("Push notification sent!");
-    }
+    // Simple HTML confirmation page for staff
+    const statusTitle = isRateLimited
+      ? "Alert Logged (Already Sent Recently)"
+      : "Alert Sent to Managers!";
+    const statusDetail = isRateLimited
+      ? "We’ve logged this again, but skipped another notification to avoid spam."
+      : "Managers have been notified. Thank you!";
+    const locationLine = locationPretty ? `<p><strong>Location:</strong> ${locationPretty}</p>` : "";
+
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Inventory Alert</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+          body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0f172a;
+            color: #e5e7eb;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 16px;
+          }
+          .card {
+            max-width: 420px;
+            width: 100%;
+            background: #020617;
+            border-radius: 16px;
+            padding: 24px 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+            text-align: center;
+            border: 1px solid #1f2937;
+          }
+          .icon {
+            font-size: 40px;
+            margin-bottom: 12px;
+          }
+          h1 {
+            font-size: 20px;
+            margin: 0 0 8px;
+          }
+          p {
+            margin: 4px 0;
+            font-size: 14px;
+            color: #9ca3af;
+          }
+          .item {
+            font-size: 16px;
+            color: #f9fafb;
+            margin-top: 8px;
+          }
+          .pill {
+            display: inline-block;
+            margin-top: 10px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            background: #1e293b;
+            color: #e5e7eb;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="icon">✅</div>
+          <h1>${statusTitle}</h1>
+          <p>${statusDetail}</p>
+          <p class="item"><strong>Item:</strong> ${itemPretty}</p>
+          ${locationLine}
+          <p class="pill">Status: ${qtyPretty}</p>
+        </div>
+      </body>
+      </html>
+    `);
   } catch (err) {
     console.error("❌ Error in /alert route:", err);
-    res.status(500).send("Error sending push notification.");
+    res
+      .status(500)
+      .send("Error sending push notification. Please tell a manager.");
   }
 });
+
 
 // ---------------- Start Server ----------------
 
