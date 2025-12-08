@@ -128,7 +128,16 @@ app.get("/alert", async (req, res) => {
         .trim() || req.ip || "";
     const userAgent = req.headers["user-agent"] || "";
 
-    await logAlertToSheet({ item, qty, location, ip, userAgent });
+    // await logAlertToSheet({ item, qty, location, ip, userAgent });
+
+    await logAlertToSheet({
+      item: itemPretty,
+      qty: qtyPretty,
+      location: locationPretty,
+      ip,
+      userAgent,
+    });
+    
 
     res.send("Push notification sent!");
   } catch (err) {
