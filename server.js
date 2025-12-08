@@ -6,7 +6,7 @@ const { google } = require("googleapis");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ Polyfill fetch for CommonJS + node-fetch v3
+// ✅ Polyfill fetch for CommonJS + node-fetch v3 (Render / Node 18+ safe)
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
@@ -17,6 +17,11 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 // ---- Google Sheets config ----
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+// ---- Cooldown config ----
+// 60 seconds between pushes for the same (item + location)
+const COOLDOWN_MS = 60 * 1000;
+const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 
 // ---------------- Utility Helpers ----------------
 
@@ -63,6 +68,8 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
     if (!sheets) return;
 
     const timestamp = new Date().toISOString();
+
+    // Columns: Time | Item | Qty | Location | IP | User Agent
     const values = [[
       timestamp,
       item,
@@ -74,7 +81,7 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A:F",  // now logging 6 columns: Time, Item, Qty, Location, IP, UA
+      range: "Sheet1!A:F", // adjust if your tab name is different
       valueInputOption: "USER_ENTERED",
       requestBody: { values },
     });
@@ -99,36 +106,45 @@ app.get("/alert", async (req, res) => {
   const locationPretty = location ? prettifyText(location) : "";
   const locationSuffix = locationPretty ? ` (Location: ${locationPretty})` : "";
 
+  // Cooldown key for "same item in same location"
+  const key = `${item}|${location || ""}`;
+  const now = Date.now();
+  const last = lastAlertByKey[key] || 0;
+  const isRateLimited = now - last < COOLDOWN_MS;
+
   try {
-    // 1) Send OneSignal push
-    const response = await fetch("https://onesignal.com/api/v1/notifications", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        Authorization: `Basic ${ONESIGNAL_API_KEY}`,
-      },
-      body: JSON.stringify({
-        app_id: ONESIGNAL_APP_ID,
-        included_segments: ["All"],
-        headings: { en: "Inventory Alert" },
-        contents: {
-          en: `Inventory Alert${locationSuffix}: ${itemPretty} is ${qtyPretty}. Please restock.`,
+    // 1) Send OneSignal push (only if not on cooldown)
+    if (isRateLimited) {
+      console.log(`⏱ Cooldown active, not sending push for ${key}`);
+    } else {
+      const response = await fetch("https://onesignal.com/api/v1/notifications", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          Authorization: `Basic ${ONESIGNAL_API_KEY}`,
         },
-        url: "https://inventory-alert-gx9o.onrender.com/",
-      }),
-    });
+        body: JSON.stringify({
+          app_id: ONESIGNAL_APP_ID,
+          included_segments: ["All"],
+          headings: { en: "Inventory Alert" },
+          contents: {
+            en: `Inventory Alert${locationSuffix}: ${itemPretty} is ${qtyPretty}. Please restock.`,
+          },
+          url: "https://inventory-alert-gx9o.onrender.com/",
+        }),
+      });
 
-    const data = await response.json();
-    console.log("📨 OneSignal response:", data);
+      const data = await response.json();
+      console.log("📨 OneSignal response:", data);
+      lastAlertByKey[key] = now;
+    }
 
-    // 2) Log to Google Sheets
+    // 2) Log to Google Sheets (always log, even during cooldown)
     const ip =
       (req.headers["x-forwarded-for"] || "")
         .split(",")[0]
         .trim() || req.ip || "";
     const userAgent = req.headers["user-agent"] || "";
-
-    // await logAlertToSheet({ item, qty, location, ip, userAgent });
 
     await logAlertToSheet({
       item: itemPretty,
@@ -137,9 +153,12 @@ app.get("/alert", async (req, res) => {
       ip,
       userAgent,
     });
-    
 
-    res.send("Push notification sent!");
+    if (isRateLimited) {
+      res.send("Alert logged (cooldown active, notification skipped).");
+    } else {
+      res.send("Push notification sent!");
+    }
   } catch (err) {
     console.error("❌ Error in /alert route:", err);
     res.status(500).send("Error sending push notification.");
