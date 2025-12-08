@@ -18,6 +18,9 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
+// ---- Manager key config ----
+const MANAGER_KEY = process.env.MANAGER_KEY || "";
+
 // ---- Cooldown config ----
 // 60 seconds between pushes for the same (item + location)
 const COOLDOWN_MS = 60 * 1000;
@@ -288,6 +291,64 @@ app.get("/alert", async (req, res) => {
 // ---------------- Manager View Endpoint ----------------
 
 app.get("/manager", async (req, res) => {
+  const providedKey = req.query.key || "";
+
+  if (!MANAGER_KEY) {
+    return res
+      .status(500)
+      .send("Manager key is not configured. Please contact the administrator.");
+  }
+
+  if (providedKey !== MANAGER_KEY) {
+    return res.status(401).send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Unauthorized</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+          body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #020617;
+            color: #e5e7eb;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 16px;
+          }
+          .card {
+            max-width: 360px;
+            width: 100%;
+            background: #020617;
+            border-radius: 16px;
+            padding: 24px 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+            text-align: center;
+            border: 1px solid #1f2937;
+          }
+          h1 {
+            font-size: 20px;
+            margin-bottom: 8px;
+          }
+          p {
+            font-size: 14px;
+            color: #9ca3af;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>Unauthorized</h1>
+          <p>This page is for managers only. Please use the correct link.</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+
   try {
     const alerts = await getRecentAlertsFromSheet(50);
 
