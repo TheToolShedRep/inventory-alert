@@ -1,7 +1,6 @@
 // server.js
 const express = require("express");
 const path = require("path");
-// const fetch = require("node-fetch");
 const { google } = require("googleapis");
 
 const app = express();
@@ -18,6 +17,16 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 // ---- Google Sheets config ----
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+// ---------------- Utility Helpers ----------------
+
+// Prettify item names like "whole_milk" → "Whole Milk"
+// Prettify qty labels like "running_low" → "Running Low"
+function prettifyText(input = "") {
+  return input
+    .replace(/_/g, " ")
+    .replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
 
 // ---------------- Google Sheets helper ----------------
 
@@ -52,14 +61,14 @@ async function getSheetsClient() {
 async function logAlertToSheet({ item, qty, ip, userAgent }) {
   try {
     const sheets = await getSheetsClient();
-    if (!sheets) return; // logging disabled or failed
+    if (!sheets) return;
 
     const timestamp = new Date().toISOString();
     const values = [[timestamp, item, qty, ip || "", userAgent || ""]];
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A:E", // use your tab name if not "Sheet1"
+      range: "Sheet1!A:E",
       valueInputOption: "USER_ENTERED",
       requestBody: { values },
     });
@@ -74,9 +83,13 @@ async function logAlertToSheet({ item, qty, ip, userAgent }) {
 
 app.use(express.static(path.join(__dirname, "public")));
 
-// Inventory alert endpoint
+// ---------------- Inventory Alert Endpoint ----------------
+
 app.get("/alert", async (req, res) => {
-  const { item = "unknown", qty = "unknown" } = req.query;
+  let { item = "unknown", qty = "unknown" } = req.query;
+
+  const itemPretty = prettifyText(item);
+  const qtyPretty = prettifyText(qty);
 
   try {
     // 1) Send OneSignal push
@@ -91,7 +104,7 @@ app.get("/alert", async (req, res) => {
         included_segments: ["All"],
         headings: { en: "Inventory Alert" },
         contents: {
-          en: `Inventory alert: ${item} is running low (qty: ${qty}). Please restock.`,
+          en: `Inventory Alert: ${itemPretty} is ${qtyPretty}. Please restock.`,
         },
         url: "https://inventory-alert-gx9o.onrender.com/",
       }),
@@ -100,7 +113,7 @@ app.get("/alert", async (req, res) => {
     const data = await response.json();
     console.log("📨 OneSignal response:", data);
 
-    // 2) Log to Google Sheets (fire-and-forget)
+    // 2) Log to Google Sheets
     const ip =
       (req.headers["x-forwarded-for"] || "")
         .split(",")[0]
@@ -115,6 +128,8 @@ app.get("/alert", async (req, res) => {
     res.status(500).send("Error sending push notification.");
   }
 });
+
+// ---------------- Start Server ----------------
 
 app.listen(PORT, () => {
   console.log(`✅ Server listening on port ${PORT}`);
