@@ -29,7 +29,9 @@ const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 function prettifyText(input = "") {
   return input
     .replace(/_/g, " ")
-    .replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+    .replace(/\w\S*/g, w =>
+      w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+    );
 }
 
 // ---------------- Google Sheets helper ----------------
@@ -92,11 +94,51 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
   }
 }
 
+// Fetch latest alerts from the sheet for the manager view
+async function getRecentAlertsFromSheet(limit = 50) {
+  try {
+    const sheets = await getSheetsClient();
+    if (!sheets) return [];
+
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: "Sheet1!A:F",
+    });
+
+    const rows = res.data.values || [];
+    if (rows.length === 0) return [];
+
+    // If the first row is your header row, you can skip it:
+    // const dataRows = rows.slice(1);
+    const dataRows = rows; // assuming no header row yet
+
+    // Take the last `limit` rows (most recent at the bottom)
+    const recent = dataRows.slice(-limit);
+
+    // Map to objects
+    return recent.map(r => {
+      const [
+        timestamp = "",
+        item = "",
+        qty = "",
+        location = "",
+        ip = "",
+        userAgent = "",
+      ] = r;
+
+      return { timestamp, item, qty, location, ip, userAgent };
+    }).reverse(); // latest first
+  } catch (err) {
+    console.error("❌ Error reading alerts from Google Sheets:", err.message);
+    return [];
+  }
+}
+
 // ---------------- Express setup ----------------
 
 app.use(express.static(path.join(__dirname, "public")));
 
-// ---------------- Inventory Alert Endpoint ----------------
+// ---------------- Inventory Alert Endpoint (staff QR) ----------------
 
 app.get("/alert", async (req, res) => {
   let { item = "unknown", qty = "unknown", location = "" } = req.query;
@@ -146,7 +188,7 @@ app.get("/alert", async (req, res) => {
         .trim() || req.ip || "";
     const userAgent = req.headers["user-agent"] || "";
 
-        await logAlertToSheet({
+    await logAlertToSheet({
       item: itemPretty,
       qty: qtyPretty,
       location: locationPretty,
@@ -154,14 +196,16 @@ app.get("/alert", async (req, res) => {
       userAgent,
     });
 
-    // Simple HTML confirmation page for staff
+    // Friendly confirmation HTML for staff
     const statusTitle = isRateLimited
       ? "Alert Logged (Already Sent Recently)"
       : "Alert Sent to Managers!";
     const statusDetail = isRateLimited
       ? "We’ve logged this again, but skipped another notification to avoid spam."
       : "Managers have been notified. Thank you!";
-    const locationLine = locationPretty ? `<p><strong>Location:</strong> ${locationPretty}</p>` : "";
+    const locationLine = locationPretty
+      ? `<p><strong>Location:</strong> ${locationPretty}</p>`
+      : "";
 
     res.send(`
       <!DOCTYPE html>
@@ -241,6 +285,122 @@ app.get("/alert", async (req, res) => {
   }
 });
 
+// ---------------- Manager View Endpoint ----------------
+
+app.get("/manager", async (req, res) => {
+  try {
+    const alerts = await getRecentAlertsFromSheet(50);
+
+    const rowsHtml = alerts
+      .map(a => {
+        const ts = a.timestamp || "";
+        const item = a.item || "";
+        const qty = a.qty || "";
+        const loc = a.location || "";
+        const ip = a.ip || "";
+        const ua = a.userAgent || "";
+        return `
+          <tr>
+            <td>${ts}</td>
+            <td>${item}</td>
+            <td>${qty}</td>
+            <td>${loc}</td>
+            <td>${ip}</td>
+            <td>${ua}</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Inventory Alerts – Manager View</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+          body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #020617;
+            color: #e5e7eb;
+            margin: 0;
+            padding: 16px;
+          }
+          h1 {
+            font-size: 22px;
+            margin-bottom: 8px;
+          }
+          p {
+            font-size: 14px;
+            color: #9ca3af;
+            margin-top: 0;
+            margin-bottom: 16px;
+          }
+          .table-wrapper {
+            overflow-x: auto;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #020617;
+            border-radius: 12px;
+            overflow: hidden;
+          }
+          thead {
+            background: #111827;
+          }
+          th, td {
+            padding: 8px 10px;
+            font-size: 12px;
+            border-bottom: 1px solid #1f2937;
+            text-align: left;
+            white-space: nowrap;
+          }
+          th {
+            font-weight: 600;
+            color: #e5e7eb;
+          }
+          tr:nth-child(even) td {
+            background: #030712;
+          }
+          .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            background: #1e293b;
+          }
+        </style>
+      </head>
+      <body>
+        <h1>Inventory Alerts – Manager View</h1>
+        <p>Showing the most recent alerts from staff. This reads directly from the live log.</p>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Item</th>
+                <th>Status</th>
+                <th>Location</th>
+                <th>IP</th>
+                <th>User Agent</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml || '<tr><td colspan="6">No alerts logged yet.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("❌ Error in /manager route:", err);
+    res.status(500).send("Error loading manager view.");
+  }
+});
 
 // ---------------- Start Server ----------------
 
