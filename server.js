@@ -1,11 +1,15 @@
 // server.js
 const express = require("express");
 const path = require("path");
-const fetch = require("node-fetch");
-// const { google } = require("googleapis");
+// const fetch = require("node-fetch");
+const { google } = require("googleapis");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ✅ Polyfill fetch for CommonJS + node-fetch v3
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 // ---- OneSignal config ----
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
