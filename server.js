@@ -20,8 +20,7 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
 // ---------------- Utility Helpers ----------------
 
-// Prettify item names like "whole_milk" → "Whole Milk"
-// Prettify qty labels like "running_low" → "Running Low"
+// "whole_milk" → "Whole Milk", "running_low" → "Running Low"
 function prettifyText(input = "") {
   return input
     .replace(/_/g, " ")
@@ -58,22 +57,29 @@ async function getSheetsClient() {
   }
 }
 
-async function logAlertToSheet({ item, qty, ip, userAgent }) {
+async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
   try {
     const sheets = await getSheetsClient();
     if (!sheets) return;
 
     const timestamp = new Date().toISOString();
-    const values = [[timestamp, item, qty, ip || "", userAgent || ""]];
+    const values = [[
+      timestamp,
+      item,
+      qty,
+      location || "",
+      ip || "",
+      userAgent || "",
+    ]];
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: "Sheet1!A:E",
+      range: "Sheet1!A:F",  // now logging 6 columns: Time, Item, Qty, Location, IP, UA
       valueInputOption: "USER_ENTERED",
       requestBody: { values },
     });
 
-    console.log("✅ Logged alert to Google Sheets:", { item, qty, ip });
+    console.log("✅ Logged alert to Google Sheets:", { item, qty, location, ip });
   } catch (err) {
     console.error("❌ Error logging to Google Sheets:", err.message);
   }
@@ -86,10 +92,12 @@ app.use(express.static(path.join(__dirname, "public")));
 // ---------------- Inventory Alert Endpoint ----------------
 
 app.get("/alert", async (req, res) => {
-  let { item = "unknown", qty = "unknown" } = req.query;
+  let { item = "unknown", qty = "unknown", location = "" } = req.query;
 
   const itemPretty = prettifyText(item);
   const qtyPretty = prettifyText(qty);
+  const locationPretty = location ? prettifyText(location) : "";
+  const locationSuffix = locationPretty ? ` (Location: ${locationPretty})` : "";
 
   try {
     // 1) Send OneSignal push
@@ -104,7 +112,7 @@ app.get("/alert", async (req, res) => {
         included_segments: ["All"],
         headings: { en: "Inventory Alert" },
         contents: {
-          en: `Inventory Alert: ${itemPretty} is ${qtyPretty}. Please restock.`,
+          en: `Inventory Alert${locationSuffix}: ${itemPretty} is ${qtyPretty}. Please restock.`,
         },
         url: "https://inventory-alert-gx9o.onrender.com/",
       }),
@@ -120,7 +128,7 @@ app.get("/alert", async (req, res) => {
         .trim() || req.ip || "";
     const userAgent = req.headers["user-agent"] || "";
 
-    await logAlertToSheet({ item, qty, ip, userAgent });
+    await logAlertToSheet({ item, qty, location, ip, userAgent });
 
     res.send("Push notification sent!");
   } catch (err) {
