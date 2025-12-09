@@ -395,11 +395,22 @@ app.get("/manager", async (req, res) => {
         const loc = a.location || "";
         const ip = a.ip || "";
         const ua = a.userAgent || "";
+
+        // 🔴🟠🟢 Decide status color based on qty text
+        const normalized = (qty || "").toLowerCase();
+        let statusClass = "status-badge status-ok";
+
+        if (/(out|empty|critical)/.test(normalized)) {
+          statusClass = "status-badge status-danger";
+        } else if (/(low|running)/.test(normalized)) {
+          statusClass = "status-badge status-warn";
+        }
+
         return `
           <tr>
             <td>${ts}</td>
             <td>${item}</td>
-            <td>${qty}</td>
+            <td><span class="${statusClass}">${qty}</span></td>
             <td>${loc}</td>
             <td>${ip}</td>
             <td>${ua}</td>
@@ -467,6 +478,27 @@ app.get("/manager", async (req, res) => {
           }
           a:hover {
             text-decoration: underline;
+          }
+
+          /* 🔴🟠🟢 Status badges */
+          .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 500;
+          }
+          .status-ok {
+            background: #064e3b;
+            color: #bbf7d0;
+          }
+          .status-warn {
+            background: #7c2d12;
+            color: #fed7aa;
+          }
+          .status-danger {
+            background: #7f1d1d;
+            color: #fecaca;
           }
         </style>
       </head>
