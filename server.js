@@ -31,8 +31,7 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const MANAGER_KEY = process.env.MANAGER_KEY || "";
 
 // ---- Cooldown config ----
-// ⏱ For testing, you can temporarily set this to 5 * 1000 (5 seconds)
-// const COOLDOWN_MS = 5 * 1000;
+// const COOLDOWN_MS = 5 * 1000; // ⏱ use this for testing (5 seconds)
 const COOLDOWN_MS = 60 * 1000; // 60 seconds between pushes for the same (item + location)
 const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 
@@ -201,7 +200,8 @@ app.get("/alert", async (req, res) => {
         contents: {
           en: `Inventory Alert${locationSuffix}: ${itemPretty} is ${qtyPretty}. Please restock.`,
         },
-        url: "https://inventory-alert-gx9o.onrender.com/",
+        // 👇 When tapping the notification, open the dynamic checklist
+        url: "https://inventory-alert-gx9o.onrender.com/checklist",
       };
 
       console.log(
@@ -346,6 +346,111 @@ app.get("/alert", async (req, res) => {
     res
       .status(500)
       .send("Error sending push notification. Please tell a manager.");
+  }
+});
+
+// ---------------- Dynamic Checklist View (HTML) ----------------
+
+app.get("/checklist", async (req, res) => {
+  try {
+    // Get recent alerts from Google Sheets
+    let alerts = await getRecentAlertsFromSheet(200);
+    const now = new Date();
+
+    // Only look at today's alerts
+    alerts = alerts.filter((a) => isSameUTCDay(a.timestamp, now));
+
+    // Keep only "low / running low / out / empty / critical"
+    const lowAlerts = alerts.filter((a) =>
+      /(low|running|out|empty|critical)/i.test(a.qty || "")
+    );
+
+    // Deduplicate by item + location
+    const byKey = new Map();
+    for (const a of lowAlerts) {
+      const key = `${a.item || ""}|${a.location || ""}`;
+      if (!byKey.has(key)) {
+        byKey.set(key, a);
+      }
+    }
+
+    const items = Array.from(byKey.values());
+
+    const listItemsHtml =
+      items.length === 0
+        ? `<li>No low-inventory items logged today yet.</li>`
+        : items
+            .map((a) => {
+              const item = a.item || "Unknown Item";
+              const loc = a.location || "";
+              const locationSuffix = loc ? ` – ${loc}` : "";
+              return `<li>☐ ${item}${locationSuffix}</li>`;
+            })
+            .join("");
+
+    // Simple HTML checklist
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Restock Checklist</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+          body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #020617;
+            color: #e5e7eb;
+            margin: 0;
+            padding: 16px;
+          }
+          h1 {
+            font-size: 22px;
+            margin-bottom: 8px;
+          }
+          p {
+            font-size: 14px;
+            color: #9ca3af;
+            margin-top: 0;
+            margin-bottom: 12px;
+          }
+          ul {
+            list-style: none;
+            padding: 0;
+          }
+          li {
+            background: #0b1120;
+            margin-bottom: 8px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #1f2937;
+            font-size: 14px;
+          }
+          .top-link {
+            display: inline-block;
+            margin-top: 12px;
+            font-size: 13px;
+            color: #60a5fa;
+            text-decoration: none;
+          }
+          .top-link:hover {
+            text-decoration: underline;
+          }
+        </style>
+      </head>
+      <body>
+        <h1>Restock Checklist</h1>
+        <p>These are the items that were logged as low or out today.</p>
+        <ul>
+          ${listItemsHtml}
+        </ul>
+        <a href="/manager" class="top-link">Open Inventory Alert Manager View →</a>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("❌ Error in /checklist route:", err);
+    res.status(500).send("Error loading checklist.");
   }
 });
 
