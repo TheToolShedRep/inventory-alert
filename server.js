@@ -468,6 +468,7 @@ app.get("/manager", async (req, res) => {
           th {
             font-weight: 600;
             color: #e5e7eb;
+            cursor: pointer; /* clickable for sorting */
           }
           tr:nth-child(even) td {
             background: #030712;
@@ -525,6 +526,44 @@ app.get("/manager", async (req, res) => {
             </tbody>
           </table>
         </div>
+        <script>
+          // Simple client-side column sorting for the manager table
+          document.addEventListener("DOMContentLoaded", function () {
+            var table = document.querySelector("table");
+            if (!table) return;
+
+            var tbody = table.querySelector("tbody");
+            var headers = table.querySelectorAll("th");
+            var sortState = {};
+
+            headers.forEach(function (th, index) {
+              th.addEventListener("click", function () {
+                var key = index;
+                var current = sortState[key] || "desc";
+                var next = current === "asc" ? "desc" : "asc";
+                sortState = {};
+                sortState[key] = next;
+
+                var rowsArray = Array.prototype.slice.call(
+                  tbody.querySelectorAll("tr")
+                );
+
+                rowsArray.sort(function (a, b) {
+                  var aText = (a.children[index].innerText || "").toLowerCase();
+                  var bText = (b.children[index].innerText || "").toLowerCase();
+
+                  if (aText < bText) return next === "asc" ? -1 : 1;
+                  if (aText > bText) return next === "asc" ? 1 : -1;
+                  return 0;
+                });
+
+                rowsArray.forEach(function (row) {
+                  tbody.appendChild(row);
+                });
+              });
+            });
+          });
+        </script>
       </body>
       </html>
     `);
