@@ -14,6 +14,15 @@ const fetch = (...args) =>
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
 const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 
+// 🔍 Extra sanity check at startup
+if (!ONESIGNAL_APP_ID || !ONESIGNAL_API_KEY) {
+  console.warn(
+    "⚠️ OneSignal config missing: check ONESIGNAL_APP_ID and ONESIGNAL_API_KEY env vars."
+  );
+} else {
+  console.log("✅ OneSignal config present.");
+}
+
 // ---- Google Sheets config ----
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
@@ -22,8 +31,9 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const MANAGER_KEY = process.env.MANAGER_KEY || "";
 
 // ---- Cooldown config ----
-// 60 seconds between pushes for the same (item + location)
-const COOLDOWN_MS = 60 * 1000;
+// ⏱ For testing, you can temporarily set this to 5 * 1000 (5 seconds)
+// const COOLDOWN_MS = 5 * 1000;
+const COOLDOWN_MS = 60 * 1000; // 60 seconds between pushes for the same (item + location)
 const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 
 // ---------------- Utility Helpers ----------------
@@ -32,7 +42,7 @@ const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 function prettifyText(input = "") {
   return input
     .replace(/_/g, " ")
-    .replace(/\w\S*/g, w =>
+    .replace(/\w\S*/g, (w) =>
       w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
     );
 }
@@ -93,14 +103,9 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
     const timestamp = new Date().toISOString();
 
     // Columns: Time | Item | Qty | Location | IP | User Agent
-    const values = [[
-      timestamp,
-      item,
-      qty,
-      location || "",
-      ip || "",
-      userAgent || "",
-    ]];
+    const values = [
+      [timestamp, item, qty, location || "", ip || "", userAgent || ""],
+    ];
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
@@ -109,7 +114,12 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
       requestBody: { values },
     });
 
-    console.log("✅ Logged alert to Google Sheets:", { item, qty, location, ip });
+    console.log("✅ Logged alert to Google Sheets:", {
+      item,
+      qty,
+      location,
+      ip,
+    });
   } catch (err) {
     console.error("❌ Error logging to Google Sheets:", err.message);
   }
@@ -137,18 +147,20 @@ async function getRecentAlertsFromSheet(limit = 50) {
     const recent = dataRows.slice(-limit);
 
     // Map to objects
-    return recent.map(r => {
-      const [
-        timestamp = "",
-        item = "",
-        qty = "",
-        location = "",
-        ip = "",
-        userAgent = "",
-      ] = r;
+    return recent
+      .map((r) => {
+        const [
+          timestamp = "",
+          item = "",
+          qty = "",
+          location = "",
+          ip = "",
+          userAgent = "",
+        ] = r;
 
-      return { timestamp, item, qty, location, ip, userAgent };
-    }).reverse(); // latest first
+        return { timestamp, item, qty, location, ip, userAgent };
+      })
+      .reverse(); // latest first
   } catch (err) {
     console.error("❌ Error reading alerts from Google Sheets:", err.message);
     return [];
@@ -176,29 +188,60 @@ app.get("/alert", async (req, res) => {
   const isRateLimited = now - last < COOLDOWN_MS;
 
   try {
-    // 1) Send OneSignal push (only if not on cooldown)
-    if (isRateLimited) {
+    // 1) Send OneSignal push (only if not on cooldown and keys present)
+    if (!ONESIGNAL_APP_ID || !ONESIGNAL_API_KEY) {
+      console.warn("🔕 Skipping push: OneSignal env vars missing.");
+    } else if (isRateLimited) {
       console.log(`⏱ Cooldown active, not sending push for ${key}`);
     } else {
-      const response = await fetch("https://onesignal.com/api/v1/notifications", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          Authorization: `Basic ${ONESIGNAL_API_KEY}`,
+      const body = {
+        app_id: ONESIGNAL_APP_ID,
+        included_segments: ["All"],
+        headings: { en: "Inventory Alert" },
+        contents: {
+          en: `Inventory Alert${locationSuffix}: ${itemPretty} is ${qtyPretty}. Please restock.`,
         },
-        body: JSON.stringify({
-          app_id: ONESIGNAL_APP_ID,
-          included_segments: ["All"],
-          headings: { en: "Inventory Alert" },
-          contents: {
-            en: `Inventory Alert${locationSuffix}: ${itemPretty} is ${qtyPretty}. Please restock.`,
-          },
-          url: "https://inventory-alert-gx9o.onrender.com/",
-        }),
-      });
+        url: "https://inventory-alert-gx9o.onrender.com/",
+      };
 
-      const data = await response.json();
-      console.log("📨 OneSignal response:", data);
+      console.log(
+        "📤 Sending OneSignal notification with body:",
+        JSON.stringify(body)
+      );
+
+      const response = await fetch(
+        "https://onesignal.com/api/v1/notifications",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            Authorization: `Basic ${ONESIGNAL_API_KEY}`,
+          },
+          body: JSON.stringify(body),
+        }
+      );
+
+      const text = await response.text();
+      console.log("📨 OneSignal raw response:", text);
+
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        console.warn("⚠️ Could not parse OneSignal response as JSON.");
+      }
+
+      if (!response.ok) {
+        console.error(
+          "❌ OneSignal HTTP error:",
+          response.status,
+          response.statusText
+        );
+      }
+      if (data && data.errors) {
+        console.error("❌ OneSignal API errors:", data.errors);
+      }
+
       lastAlertByKey[key] = now;
     }
 
@@ -388,20 +431,20 @@ app.get("/manager", async (req, res) => {
       toggleLink = `<a href="${todayUrl}">View today only</a>`;
     } else {
       // default: today
-      alerts = alerts.filter(a => isSameUTCDay(a.timestamp, now));
+      alerts = alerts.filter((a) => isSameUTCDay(a.timestamp, now));
       subtitle = "Showing alerts from today.";
       toggleLink = `<a href="${allUrl}">View all</a>`;
     }
 
     // CSV download link (preserve key + range)
     const csvUrl = MANAGER_KEY
-      ? `/manager.csv?key=${encodeURIComponent(providedKey)}&range=${encodeURIComponent(
-          rangeParam
-        )}`
+      ? `/manager.csv?key=${encodeURIComponent(
+          providedKey
+        )}&range=${encodeURIComponent(rangeParam)}`
       : `/manager.csv?range=${encodeURIComponent(rangeParam)}`;
 
     const rowsHtml = alerts
-      .map(a => {
+      .map((a) => {
         const ts = a.timestamp || "";
         const item = a.item || "";
         const qty = a.qty || "";
@@ -653,7 +696,7 @@ app.get("/manager.csv", async (req, res) => {
     const now = new Date();
 
     if (rangeParam !== "all") {
-      alerts = alerts.filter(a => isSameUTCDay(a.timestamp, now));
+      alerts = alerts.filter((a) => isSameUTCDay(a.timestamp, now));
     }
 
     // Build CSV header
@@ -664,15 +707,17 @@ app.get("/manager.csv", async (req, res) => {
     ];
 
     // Add rows
-    alerts.forEach(a => {
-      csv.push([
-        csvEscape(a.timestamp || ""),
-        csvEscape(a.item || ""),
-        csvEscape(a.qty || ""),
-        csvEscape(a.location || ""),
-        csvEscape(a.ip || ""),
-        csvEscape(a.userAgent || ""),
-      ].join(","));
+    alerts.forEach((a) => {
+      csv.push(
+        [
+          csvEscape(a.timestamp || ""),
+          csvEscape(a.item || ""),
+          csvEscape(a.qty || ""),
+          csvEscape(a.location || ""),
+          csvEscape(a.ip || ""),
+          csvEscape(a.userAgent || ""),
+        ].join(",")
+      );
     });
 
     const csvString = csv.join("\r\n");
