@@ -49,6 +49,12 @@ function isSameUTCDay(timestamp, refDate = new Date()) {
   );
 }
 
+// Basic CSV escaping: wrap in quotes and double any internal quotes
+function csvEscape(value = "") {
+  const str = String(value ?? "");
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
 // ---------------- Google Sheets helper ----------------
 
 let sheetsClient = null;
@@ -109,7 +115,7 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
   }
 }
 
-// Fetch latest alerts from the sheet for the manager view
+// Fetch latest alerts from the sheet for the manager view / CSV
 async function getRecentAlertsFromSheet(limit = 50) {
   try {
     const sheets = await getSheetsClient();
@@ -300,7 +306,7 @@ app.get("/alert", async (req, res) => {
   }
 });
 
-// ---------------- Manager View Endpoint ----------------
+// ---------------- Manager View Endpoint (HTML) ----------------
 
 app.get("/manager", async (req, res) => {
   try {
@@ -387,6 +393,13 @@ app.get("/manager", async (req, res) => {
       toggleLink = `<a href="${allUrl}">View all</a>`;
     }
 
+    // CSV download link (preserve key + range)
+    const csvUrl = MANAGER_KEY
+      ? `/manager.csv?key=${encodeURIComponent(providedKey)}&range=${encodeURIComponent(
+          rangeParam
+        )}`
+      : `/manager.csv?range=${encodeURIComponent(rangeParam)}`;
+
     const rowsHtml = alerts
       .map(a => {
         const ts = a.timestamp || "";
@@ -444,6 +457,14 @@ app.get("/manager", async (req, res) => {
             margin-top: 0;
             margin-bottom: 8px;
           }
+          .top-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+          }
           .legend {
             display: flex;
             flex-wrap: wrap;
@@ -456,6 +477,22 @@ app.get("/manager", async (req, res) => {
           .legend-label {
             font-weight: 500;
             margin-right: 2px;
+          }
+          .btn-csv {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 500;
+            border: 1px solid #1f2937;
+            background: #0b1120;
+            color: #e5e7eb;
+            text-decoration: none;
+          }
+          .btn-csv:hover {
+            background: #111827;
           }
           .table-wrapper {
             overflow-x: auto;
@@ -518,7 +555,10 @@ app.get("/manager", async (req, res) => {
       </head>
       <body>
         <h1>Inventory Alerts – Manager View</h1>
-        <p>${subtitle} &nbsp; ${toggleLink}</p>
+        <div class="top-bar">
+          <p>${subtitle} &nbsp; ${toggleLink}</p>
+          <a href="${csvUrl}" class="btn-csv">Download CSV</a>
+        </div>
         <div class="legend">
           <span class="legend-label">Legend:</span>
           <span class="status-badge status-danger">Out / Empty / Critical</span>
@@ -589,6 +629,69 @@ app.get("/manager", async (req, res) => {
   } catch (err) {
     console.error("❌ Error in /manager route:", err);
     res.status(500).send("Error loading manager view.");
+  }
+});
+
+// ---------------- Manager CSV Endpoint ----------------
+
+app.get("/manager.csv", async (req, res) => {
+  try {
+    const providedKey = (req.query.key || "").toString();
+
+    // 🔐 Same key protection as /manager
+    if (MANAGER_KEY) {
+      if (providedKey !== MANAGER_KEY) {
+        console.warn("⚠️ Invalid or missing manager key on /manager.csv");
+        return res.status(401).send("Access denied");
+      }
+    } else {
+      console.warn("⚠️ MANAGER_KEY is not set; /manager.csv is open to anyone.");
+    }
+
+    const rangeParam = (req.query.range || "today").toLowerCase();
+    let alerts = await getRecentAlertsFromSheet(500); // allow more for export
+    const now = new Date();
+
+    if (rangeParam !== "all") {
+      alerts = alerts.filter(a => isSameUTCDay(a.timestamp, now));
+    }
+
+    // Build CSV header
+    let csv = [
+      ["Time", "Item", "Status", "Location", "IP", "User Agent"]
+        .map(csvEscape)
+        .join(","),
+    ];
+
+    // Add rows
+    alerts.forEach(a => {
+      csv.push([
+        csvEscape(a.timestamp || ""),
+        csvEscape(a.item || ""),
+        csvEscape(a.qty || ""),
+        csvEscape(a.location || ""),
+        csvEscape(a.ip || ""),
+        csvEscape(a.userAgent || ""),
+      ].join(","));
+    });
+
+    const csvString = csv.join("\r\n");
+
+    // Set headers for download
+    const filename =
+      rangeParam === "all"
+        ? "inventory-alerts-all.csv"
+        : "inventory-alerts-today.csv";
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${filename}"`
+    );
+    res.send(csvString);
+  } catch (err) {
+    console.error("❌ Error in /manager.csv route:", err);
+    res.status(500).send("Error generating CSV.");
   }
 });
 
