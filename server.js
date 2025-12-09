@@ -444,6 +444,19 @@ app.get("/manager", async (req, res) => {
             margin-top: 0;
             margin-bottom: 8px;
           }
+          .legend {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: #9ca3af;
+            margin-bottom: 10px;
+          }
+          .legend-label {
+            font-weight: 500;
+            margin-right: 2px;
+          }
           .table-wrapper {
             overflow-x: auto;
             margin-top: 8px;
@@ -506,6 +519,12 @@ app.get("/manager", async (req, res) => {
       <body>
         <h1>Inventory Alerts – Manager View</h1>
         <p>${subtitle} &nbsp; ${toggleLink}</p>
+        <div class="legend">
+          <span class="legend-label">Legend:</span>
+          <span class="status-badge status-danger">Out / Empty / Critical</span>
+          <span class="status-badge status-warn">Low / Running Low</span>
+          <span class="status-badge status-ok">OK / Test / Other</span>
+        </div>
         <div class="table-wrapper">
           <table>
             <thead>
