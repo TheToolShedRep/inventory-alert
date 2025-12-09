@@ -34,6 +34,114 @@
         logEl.textContent += msg + "\n";
       }
 
+      const ONESIGNAL_APP_ID = "81d9cfde-7c59-4527-a003-1716bcbb2bff";
+
+      // Safer check so we don't crash if Notification is undefined
+      let permText = "Notification API not available";
+      if ("Notification" in window && Notification.permission) {
+        permText = Notification.permission;
+      }
+      log("Notification.permission (raw) = " + permText);
+
+      window.OneSignal = window.OneSignal || [];
+      OneSignal.push(function () {
+        log("Initializing OneSignal…");
+
+        OneSignal.init({
+          appId: ONESIGNAL_APP_ID,
+          notifyButton: { enable: false },
+        });
+
+        log("OneSignal.init() called");
+
+        // Is push even supported on this browser?
+        if (typeof OneSignal.isPushNotificationsSupported === "function") {
+          const supported = OneSignal.isPushNotificationsSupported();
+          log("isPushNotificationsSupported = " + supported);
+        } else {
+          log(
+            "isPushNotificationsSupported() not available (likely newer SDK)."
+          );
+        }
+
+        // Legacy-style: log when subscription changes
+        if (typeof OneSignal.on === "function") {
+          OneSignal.on("subscriptionChange", function (isSubscribed) {
+            log("subscriptionChange event: isSubscribed = " + isSubscribed);
+          });
+        } else {
+          log("OneSignal.on('subscriptionChange') not available.");
+        }
+
+        // Check if already enabled
+        if (typeof OneSignal.isPushNotificationsEnabled === "function") {
+          OneSignal.isPushNotificationsEnabled(function (enabled) {
+            log("isPushNotificationsEnabled (on load) = " + enabled);
+          });
+        } else {
+          log("isPushNotificationsEnabled() not available.");
+        }
+
+        // Try to get a user ID (might be null until subscribed)
+        if (typeof OneSignal.getUserId === "function") {
+          OneSignal.getUserId(function (userId) {
+            log("getUserId() = " + userId);
+          });
+        } else {
+          log("getUserId() not available on this SDK version.");
+        }
+      });
+
+      document
+        .getElementById("enable-btn")
+        .addEventListener("click", function () {
+          log("Enable Notifications button clicked.");
+
+          OneSignal.push(async function () {
+            try {
+              // For older SDK (player model)
+              if (
+                typeof OneSignal.registerForPushNotifications === "function"
+              ) {
+                log("Calling OneSignal.registerForPushNotifications()…");
+                await OneSignal.registerForPushNotifications();
+              } else if (
+                OneSignal.Notifications &&
+                typeof OneSignal.Notifications.requestPermission === "function"
+              ) {
+                // For newer SDK (user model)
+                log("Calling OneSignal.Notifications.requestPermission()…");
+                await OneSignal.Notifications.requestPermission();
+              } else {
+                log("No known permission API on this OneSignal SDK.");
+              }
+
+              // Check status again after prompt
+              if (typeof OneSignal.isPushNotificationsEnabled === "function") {
+                OneSignal.isPushNotificationsEnabled(function (enabled) {
+                  log("isPushNotificationsEnabled (after click) = " + enabled);
+                });
+              }
+
+              if (typeof OneSignal.getUserId === "function") {
+                OneSignal.getUserId(function (userId) {
+                  log("getUserId() (after click) = " + userId);
+                });
+              }
+            } catch (e) {
+              log("Error while requesting permission: " + e.message);
+            }
+          });
+        });
+    </script>
+
+    <!-- <script>
+      const logEl = document.getElementById("log");
+      function log(msg) {
+        console.log(msg);
+        logEl.textContent += msg + "\n";
+      }
+
       // Replace this with your real app ID
       const ONESIGNAL_APP_ID = "81d9cfde-7c59-4527-a003-1716bcbb2bff"; // <-- your App ID here
 
@@ -78,6 +186,6 @@
             }
           });
         });
-    </script>
+    </script> -->
   </body>
 </html>
