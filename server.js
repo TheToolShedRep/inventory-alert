@@ -18,6 +18,9 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
+// ---- Manager key (for /manager access) ----
+const MANAGER_KEY = process.env.MANAGER_KEY || "";
+
 // ---- Cooldown config ----
 // 60 seconds between pushes for the same (item + location)
 const COOLDOWN_MS = 60 * 1000;
@@ -32,6 +35,18 @@ function prettifyText(input = "") {
     .replace(/\w\S*/g, w =>
       w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
     );
+}
+
+// Compare if a timestamp string is the same UTC calendar day as refDate
+function isSameUTCDay(timestamp, refDate = new Date()) {
+  const d = new Date(timestamp);
+  if (Number.isNaN(d.getTime())) return false;
+
+  return (
+    d.getUTCFullYear() === refDate.getUTCFullYear() &&
+    d.getUTCMonth() === refDate.getUTCMonth() &&
+    d.getUTCDate() === refDate.getUTCDate()
+  );
 }
 
 // ---------------- Google Sheets helper ----------------
@@ -289,7 +304,88 @@ app.get("/alert", async (req, res) => {
 
 app.get("/manager", async (req, res) => {
   try {
-    const alerts = await getRecentAlertsFromSheet(50);
+    const providedKey = (req.query.key || "").toString();
+
+    // 🔐 If MANAGER_KEY is set, require it in the query
+    if (MANAGER_KEY) {
+      if (providedKey !== MANAGER_KEY) {
+        console.warn("⚠️ Invalid or missing manager key on /manager");
+        return res.status(401).send(`
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <title>Access Denied</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <style>
+              body {
+                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #020617;
+                color: #e5e7eb;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+                padding: 16px;
+              }
+              .card {
+                max-width: 420px;
+                width: 100%;
+                background: #0b1120;
+                border-radius: 16px;
+                padding: 24px 20px;
+                text-align: center;
+                border: 1px solid #1f2937;
+              }
+              h1 {
+                font-size: 20px;
+                margin-bottom: 8px;
+              }
+              p {
+                font-size: 14px;
+                color: #9ca3af;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>Access Denied</h1>
+              <p>This page is for managers only.</p>
+            </div>
+          </body>
+          </html>
+        `);
+      }
+    } else {
+      console.warn("⚠️ MANAGER_KEY is not set; /manager is open to anyone.");
+    }
+
+    const rangeParam = (req.query.range || "today").toLowerCase(); // "today" | "all"
+    let alerts = await getRecentAlertsFromSheet(50);
+    const now = new Date();
+
+    let subtitle;
+    let toggleLink;
+
+    // Build URLs that preserve the key if present
+    const todayUrl = MANAGER_KEY
+      ? `/manager?key=${encodeURIComponent(providedKey)}&range=today`
+      : `/manager?range=today`;
+
+    const allUrl = MANAGER_KEY
+      ? `/manager?key=${encodeURIComponent(providedKey)}&range=all`
+      : `/manager?range=all`;
+
+    if (rangeParam === "all") {
+      subtitle = "Showing all recent alerts.";
+      toggleLink = `<a href="${todayUrl}">View today only</a>`;
+    } else {
+      // default: today
+      alerts = alerts.filter(a => isSameUTCDay(a.timestamp, now));
+      subtitle = "Showing alerts from today.";
+      toggleLink = `<a href="${allUrl}">View all</a>`;
+    }
 
     const rowsHtml = alerts
       .map(a => {
@@ -335,10 +431,11 @@ app.get("/manager", async (req, res) => {
             font-size: 14px;
             color: #9ca3af;
             margin-top: 0;
-            margin-bottom: 16px;
+            margin-bottom: 8px;
           }
           .table-wrapper {
             overflow-x: auto;
+            margin-top: 8px;
           }
           table {
             width: 100%;
@@ -364,18 +461,18 @@ app.get("/manager", async (req, res) => {
           tr:nth-child(even) td {
             background: #030712;
           }
-          .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-size: 11px;
-            background: #1e293b;
+          a {
+            color: #60a5fa;
+            text-decoration: none;
+          }
+          a:hover {
+            text-decoration: underline;
           }
         </style>
       </head>
       <body>
         <h1>Inventory Alerts – Manager View</h1>
-        <p>Showing the most recent alerts from staff. This reads directly from the live log.</p>
+        <p>${subtitle} &nbsp; ${toggleLink}</p>
         <div class="table-wrapper">
           <table>
             <thead>
@@ -389,7 +486,10 @@ app.get("/manager", async (req, res) => {
               </tr>
             </thead>
             <tbody>
-              ${rowsHtml || '<tr><td colspan="6">No alerts logged yet.</td></tr>'}
+              ${
+                rowsHtml ||
+                '<tr><td colspan="6">No alerts for the selected range.</td></tr>'
+              }
             </tbody>
           </table>
         </div>
