@@ -1,21 +1,24 @@
 // server.js
 require("dotenv").config();
 
-
 const express = require("express");
 const path = require("path");
 const { google } = require("googleapis");
 
-const cookieParser = require("cookie-parser");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
+// Clerk (Core 2 / @clerk/backend)
+const { createClerkClient } = require("@clerk/backend");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Important on Render so req.protocol is correct behind proxy
+app.set("trust proxy", 1);
+
 // ✅ Polyfill fetch for CommonJS + node-fetch v3 (Render / Node 18+ safe)
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
+// ---------------- ENV ----------------
 
 // ---- OneSignal config ----
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
@@ -33,25 +36,31 @@ if (!ONESIGNAL_APP_ID || !ONESIGNAL_API_KEY) {
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-// ---- Login config (V2-lite) ----
-const LOGIN_USER = process.env.LOGIN_USER || "manager";
-const LOGIN_PASS_HASH = process.env.LOGIN_PASS_HASH || ""; // bcrypt hash
-const JWT_SECRET = process.env.JWT_SECRET || "";
+// ---- Clerk config ----
+// You MUST set these in Render env vars:
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY || "";
+const CLERK_PUBLISHABLE_KEY = process.env.CLERK_PUBLISHABLE_KEY || "";
 
-if (!LOGIN_PASS_HASH || !JWT_SECRET) {
+// This should be a FULL URL to Clerk hosted sign-in page, like:
+// https://ample-crow-22.accounts.dev/sign-in
+const CLERK_SIGN_IN_URL = process.env.CLERK_SIGN_IN_URL || "";
+
+// Optional: where to send users after they sign in (defaults to /checklist)
+const DEFAULT_AFTER_LOGIN = process.env.DEFAULT_AFTER_LOGIN || "/checklist";
+
+if (!CLERK_SECRET_KEY || !CLERK_PUBLISHABLE_KEY || !CLERK_SIGN_IN_URL) {
   console.warn(
-    "⚠️ Login env vars missing. Set LOGIN_PASS_HASH and JWT_SECRET in Render."
+    "⚠️ Clerk env vars missing. Set CLERK_SECRET_KEY, CLERK_PUBLISHABLE_KEY, and CLERK_SIGN_IN_URL."
   );
 }
 
 // ---- Cooldown config ----
-const COOLDOWN_MS = 60 * 1000; // 60 seconds
+const COOLDOWN_MS = 60 * 1000; // 60 seconds between pushes for same (item+location)
 const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 
 // ---------------- Express setup ----------------
 app.use(express.static(path.join(__dirname, "public")));
-app.use(express.urlencoded({ extended: true })); // for form POSTs
-app.use(cookieParser());
+app.use(express.urlencoded({ extended: true })); // for form POSTs (not used much now, but fine)
 
 // ---------------- Utility Helpers ----------------
 function prettifyText(input = "") {
@@ -77,43 +86,89 @@ function csvEscape(value = "") {
   return `"${str.replace(/"/g, '""')}"`;
 }
 
-// ---------------- Simple Auth (JWT Cookie) ----------------
-// Cookie name for auth token
-const AUTH_COOKIE = "inv_auth";
+// ---------------- Clerk Auth (server-side) ----------------
 
-function signAuthToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+// Create Clerk client once
+const clerkClient = createClerkClient({
+  secretKey: CLERK_SECRET_KEY,
+});
+
+// Build a Web-standard Request from Express req so Clerk can authenticate it
+function toWebRequest(req) {
+  const fullUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+  // Express headers are already a plain object; Request can accept it
+  return new Request(fullUrl, {
+    method: req.method,
+    headers: req.headers,
+  });
 }
 
-function verifyAuthToken(token) {
+// Middleware: require user to be signed in via Clerk
+async function requireClerkAuth(req, res, next) {
   try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch {
-    return null;
+    if (!CLERK_SECRET_KEY || !CLERK_PUBLISHABLE_KEY || !CLERK_SIGN_IN_URL) {
+      return res
+        .status(500)
+        .send(
+          "Clerk is not configured. Set CLERK_SECRET_KEY, CLERK_PUBLISHABLE_KEY, and CLERK_SIGN_IN_URL."
+        );
+    }
+
+    const requestState = await clerkClient.authenticateRequest(toWebRequest(req), {
+      publishableKey: CLERK_PUBLISHABLE_KEY,
+    });
+
+    const auth = requestState.toAuth();
+
+    // Not signed in → redirect to Clerk Hosted Sign-In
+    if (!auth.userId) {
+      const returnTo = encodeURIComponent(
+        `${req.protocol}://${req.get("host")}${req.originalUrl}`
+      );
+
+      // Clerk hosted pages accept redirect_url
+      // Example: https://xxxx.accounts.dev/sign-in?redirect_url=https://yourapp.com/checklist
+      return res.redirect(`${CLERK_SIGN_IN_URL}?redirect_url=${returnTo}`);
+    }
+
+    // Attach auth to req for later if needed
+    req.clerkAuth = auth;
+    next();
+  } catch (err) {
+    console.error("❌ Clerk auth error:", err);
+    return res.status(500).send("Auth error.");
   }
 }
 
-// Middleware to protect manager routes
-function requireAuth(req, res, next) {
-  // If login isn’t configured yet, block access (safer)
-  if (!JWT_SECRET || !LOGIN_PASS_HASH) {
+// Home: send signed-in people to checklist; others to sign-in
+app.get("/", async (req, res) => {
+  // If Clerk isn’t configured, just show a basic message
+  if (!CLERK_SECRET_KEY || !CLERK_PUBLISHABLE_KEY || !CLERK_SIGN_IN_URL) {
     return res
-      .status(500)
-      .send("Login is not configured. Set LOGIN_PASS_HASH and JWT_SECRET.");
+      .status(200)
+      .send("Server is running, but Clerk env vars are missing.");
   }
 
-  const token = req.cookies[AUTH_COOKIE];
-  const decoded = token ? verifyAuthToken(token) : null;
-
-  if (!decoded) {
-    // Redirect to login with return url
-    const returnTo = encodeURIComponent(req.originalUrl || "/manager");
-    return res.redirect(`/login?returnTo=${returnTo}`);
+  // Try authenticate silently; if not authed, go to sign-in
+  try {
+    const requestState = await clerkClient.authenticateRequest(toWebRequest(req), {
+      publishableKey: CLERK_PUBLISHABLE_KEY,
+    });
+    const auth = requestState.toAuth();
+    if (!auth.userId) {
+      const returnTo = encodeURIComponent(
+        `${req.protocol}://${req.get("host")}${DEFAULT_AFTER_LOGIN}`
+      );
+      return res.redirect(`${CLERK_SIGN_IN_URL}?redirect_url=${returnTo}`);
+    }
+    return res.redirect(DEFAULT_AFTER_LOGIN);
+  } catch (e) {
+    const returnTo = encodeURIComponent(
+      `${req.protocol}://${req.get("host")}${DEFAULT_AFTER_LOGIN}`
+    );
+    return res.redirect(`${CLERK_SIGN_IN_URL}?redirect_url=${returnTo}`);
   }
-
-  req.user = decoded;
-  next();
-}
+});
 
 // ---------------- Google Sheets helper ----------------
 let sheetsClient = null;
@@ -148,6 +203,7 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
     if (!sheets) return;
 
     const timestamp = new Date().toISOString();
+
     const values = [
       [timestamp, item, qty, location || "", ip || "", userAgent || ""],
     ];
@@ -178,8 +234,7 @@ async function getRecentAlertsFromSheet(limit = 50) {
     const rows = res.data.values || [];
     if (rows.length === 0) return [];
 
-    const dataRows = rows; // assuming no header row
-    const recent = dataRows.slice(-limit);
+    const recent = rows.slice(-limit);
 
     return recent
       .map((r) => {
@@ -194,116 +249,12 @@ async function getRecentAlertsFromSheet(limit = 50) {
 
         return { timestamp, item, qty, location, ip, userAgent };
       })
-      .reverse();
+      .reverse(); // latest first
   } catch (err) {
     console.error("❌ Error reading alerts from Google Sheets:", err.message);
     return [];
   }
 }
-
-// ---------------- Login Routes ----------------
-
-// GET /login (simple HTML form)
-app.get("/login", (req, res) => {
-  const returnTo = (req.query.returnTo || "/manager").toString();
-
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <title>Manager Login</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <style>
-        body{
-          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          background:#020617; color:#e5e7eb;
-          display:flex; align-items:center; justify-content:center;
-          min-height:100vh; margin:0; padding:16px;
-        }
-        .card{
-          width:100%; max-width:420px;
-          background:#0b1120; border:1px solid #1f2937;
-          border-radius:16px; padding:22px;
-        }
-        h1{ margin:0 0 8px; font-size:20px; }
-        p{ margin:0 0 16px; color:#9ca3af; font-size:13px; }
-        label{ display:block; font-size:12px; color:#9ca3af; margin:10px 0 6px; }
-        input{
-          width:100%; padding:10px 12px; border-radius:10px;
-          border:1px solid #1f2937; background:#020617; color:#e5e7eb;
-          font-size:14px;
-        }
-        button{
-          width:100%; margin-top:14px; padding:10px 12px;
-          border-radius:10px; border:1px solid #1f2937;
-          background:#111827; color:#e5e7eb; font-weight:600;
-          cursor:pointer;
-        }
-        button:hover{ background:#0f172a; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>Manager Login</h1>
-        <p>Sign in to view the checklist and inventory dashboard.</p>
-        <form method="POST" action="/login">
-          <input type="hidden" name="returnTo" value="${returnTo.replace(/"/g, "&quot;")}" />
-          <label>Username</label>
-          <input name="username" autocomplete="username" required />
-          <label>Password</label>
-          <input name="password" type="password" autocomplete="current-password" required />
-          <button type="submit">Sign In</button>
-        </form>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-// POST /login (verify + set cookie)
-app.post("/login", async (req, res) => {
-  try {
-    const { username = "", password = "", returnTo = "/manager" } = req.body;
-
-    // Basic checks
-    if (!LOGIN_PASS_HASH || !JWT_SECRET) {
-      return res
-        .status(500)
-        .send("Login not configured. Set LOGIN_PASS_HASH and JWT_SECRET.");
-    }
-
-    if (username !== LOGIN_USER) {
-      return res.status(401).send("Invalid login.");
-    }
-
-    const ok = await bcrypt.compare(password, LOGIN_PASS_HASH);
-    if (!ok) {
-      return res.status(401).send("Invalid login.");
-    }
-
-    const token = signAuthToken({ username });
-
-    // httpOnly cookie so JS can’t steal it
-    res.cookie(AUTH_COOKIE, token, {
-      httpOnly: true,
-      secure: true, // Render is HTTPS
-      sameSite: "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
-
-    res.redirect(returnTo);
-  } catch (err) {
-    console.error("❌ Login error:", err);
-    res.status(500).send("Login error.");
-  }
-});
-
-// GET /logout (clear cookie)
-app.get("/logout", (req, res) => {
-  res.clearCookie(AUTH_COOKIE, { httpOnly: true, secure: true, sameSite: "lax" });
-  res.redirect("/login");
-});
 
 // ---------------- Inventory Alert Endpoint (staff QR) ----------------
 
@@ -321,7 +272,7 @@ app.get("/alert", async (req, res) => {
   const isRateLimited = now - last < COOLDOWN_MS;
 
   try {
-    // 1) Send push (tap opens checklist)
+    // 1) Push notification (tap opens checklist)
     if (!ONESIGNAL_APP_ID || !ONESIGNAL_API_KEY) {
       console.warn("🔕 Skipping push: OneSignal env vars missing.");
     } else if (isRateLimited) {
@@ -352,7 +303,7 @@ app.get("/alert", async (req, res) => {
       lastAlertByKey[key] = now;
     }
 
-    // 2) Log to Sheets
+    // 2) Log to sheet (always, even if push cooldown)
     const ip =
       (req.headers["x-forwarded-for"] || "")
         .split(",")[0]
@@ -367,7 +318,7 @@ app.get("/alert", async (req, res) => {
       userAgent,
     });
 
-    // Confirmation
+    // Confirmation page for staff
     const statusTitle = isRateLimited
       ? "Alert Logged (Already Sent Recently)"
       : "Alert Sent to Managers!";
@@ -413,21 +364,26 @@ app.get("/alert", async (req, res) => {
     `);
   } catch (err) {
     console.error("❌ Error in /alert route:", err);
-    res.status(500).send("Error sending push notification. Please tell a manager.");
+    res.status(500).send("Error sending notification. Please tell a manager.");
   }
 });
 
-// ---------------- Dynamic Checklist View (Protected) ----------------
-app.get("/checklist", requireAuth, async (req, res) => {
+// ---------------- Checklist (Protected by Clerk) ----------------
+
+app.get("/checklist", requireClerkAuth, async (req, res) => {
   try {
     let alerts = await getRecentAlertsFromSheet(200);
     const now = new Date();
 
+    // Today only
     alerts = alerts.filter((a) => isSameUTCDay(a.timestamp, now));
+
+    // low/out only
     const lowAlerts = alerts.filter((a) =>
       /(low|running|out|empty|critical)/i.test(a.qty || "")
     );
 
+    // Deduplicate by item + location
     const byKey = new Map();
     for (const a of lowAlerts) {
       const key = `${a.item || ""}|${a.location || ""}`;
@@ -465,10 +421,11 @@ app.get("/checklist", requireAuth, async (req, res) => {
           .row{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
           .btn{
             display:inline-flex; align-items:center; justify-content:center;
-            padding:8px 10px; border-radius:999px; font-size:12px; font-weight:600;
+            padding:8px 10px; border-radius:999px; font-size:12px; font-weight:700;
             border:1px solid #1f2937; background:#0b1120; color:#e5e7eb; text-decoration:none;
           }
           .btn:hover{ background:#111827; }
+          .sub{ font-size:12px; color:#9ca3af; margin-top:10px; }
         </style>
       </head>
       <body>
@@ -478,8 +435,9 @@ app.get("/checklist", requireAuth, async (req, res) => {
 
         <div class="row">
           <a href="/manager" class="btn">Open Inventory Manager View →</a>
-          <a href="/logout" class="btn">Logout</a>
         </div>
+
+        <p class="sub">Signed in (Clerk user): <strong>${req.clerkAuth.userId}</strong></p>
       </body>
       </html>
     `);
@@ -489,10 +447,11 @@ app.get("/checklist", requireAuth, async (req, res) => {
   }
 });
 
-// ---------------- Manager View Endpoint (Protected) ----------------
-app.get("/manager", requireAuth, async (req, res) => {
+// ---------------- Manager View (Protected by Clerk) ----------------
+
+app.get("/manager", requireClerkAuth, async (req, res) => {
   try {
-    const rangeParam = (req.query.range || "today").toLowerCase(); // "today" | "all"
+    const rangeParam = (req.query.range || "today").toLowerCase(); // today | all
     let alerts = await getRecentAlertsFromSheet(50);
     const now = new Date();
 
@@ -524,8 +483,10 @@ app.get("/manager", requireAuth, async (req, res) => {
 
         const normalized = (qty || "").toLowerCase();
         let statusClass = "status-badge status-ok";
-        if (/(out|empty|critical)/.test(normalized)) statusClass = "status-badge status-danger";
-        else if (/(low|running)/.test(normalized)) statusClass = "status-badge status-warn";
+        if (/(out|empty|critical)/.test(normalized))
+          statusClass = "status-badge status-danger";
+        else if (/(low|running)/.test(normalized))
+          statusClass = "status-badge status-warn";
 
         return `
           <tr>
@@ -554,22 +515,23 @@ app.get("/manager", requireAuth, async (req, res) => {
           p{ font-size:14px; color:#9ca3af; margin-top:0; margin-bottom:8px; }
           .top-bar{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
           .legend{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:11px; color:#9ca3af; margin-bottom:10px; }
-          .legend-label{ font-weight:500; margin-right:2px; }
+          .legend-label{ font-weight:600; margin-right:2px; }
           .btn{ display:inline-flex; align-items:center; justify-content:center; padding:6px 10px; border-radius:999px;
-            font-size:11px; font-weight:600; border:1px solid #1f2937; background:#0b1120; color:#e5e7eb; text-decoration:none; }
+            font-size:11px; font-weight:800; border:1px solid #1f2937; background:#0b1120; color:#e5e7eb; text-decoration:none; }
           .btn:hover{ background:#111827; }
           .table-wrapper{ overflow-x:auto; margin-top:8px; }
           table{ width:100%; border-collapse:collapse; background:#020617; border-radius:12px; overflow:hidden; }
           thead{ background:#111827; }
           th,td{ padding:8px 10px; font-size:12px; border-bottom:1px solid #1f2937; text-align:left; white-space:nowrap; }
-          th{ font-weight:600; color:#e5e7eb; cursor:pointer; }
+          th{ font-weight:700; color:#e5e7eb; cursor:pointer; }
           tr:nth-child(even) td{ background:#030712; }
           a{ color:#60a5fa; text-decoration:none; }
           a:hover{ text-decoration:underline; }
-          .status-badge{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+          .status-badge{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:800; }
           .status-ok{ background:#064e3b; color:#bbf7d0; }
           .status-warn{ background:#7c2d12; color:#fed7aa; }
           .status-danger{ background:#7f1d1d; color:#fecaca; }
+          .sub{ font-size:12px; color:#9ca3af; margin-top:10px; }
         </style>
       </head>
       <body>
@@ -579,7 +541,6 @@ app.get("/manager", requireAuth, async (req, res) => {
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <a href="/checklist" class="btn">View Restock Checklist</a>
             <a href="${csvUrl}" class="btn">Download CSV</a>
-            <a href="/logout" class="btn">Logout</a>
           </div>
         </div>
 
@@ -608,6 +569,8 @@ app.get("/manager", requireAuth, async (req, res) => {
           </table>
         </div>
 
+        <p class="sub">Signed in (Clerk user): <strong>${req.clerkAuth.userId}</strong></p>
+
         <script>
           document.addEventListener("DOMContentLoaded", function () {
             var table = document.querySelector("table");
@@ -619,11 +582,10 @@ app.get("/manager", requireAuth, async (req, res) => {
 
             headers.forEach(function (th, index) {
               th.addEventListener("click", function () {
-                var key = index;
-                var current = sortState[key] || "desc";
+                var current = sortState[index] || "desc";
                 var next = current === "asc" ? "desc" : "asc";
                 sortState = {};
-                sortState[key] = next;
+                sortState[index] = next;
 
                 var rowsArray = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
                 rowsArray.sort(function (a, b) {
@@ -648,8 +610,9 @@ app.get("/manager", requireAuth, async (req, res) => {
   }
 });
 
-// ---------------- Manager CSV Endpoint (Protected) ----------------
-app.get("/manager.csv", requireAuth, async (req, res) => {
+// ---------------- Manager CSV (Protected by Clerk) ----------------
+
+app.get("/manager.csv", requireClerkAuth, async (req, res) => {
   try {
     const rangeParam = (req.query.range || "today").toLowerCase();
     let alerts = await getRecentAlertsFromSheet(500);
@@ -680,7 +643,9 @@ app.get("/manager.csv", requireAuth, async (req, res) => {
 
     const csvString = csv.join("\r\n");
     const filename =
-      rangeParam === "all" ? "inventory-alerts-all.csv" : "inventory-alerts-today.csv";
+      rangeParam === "all"
+        ? "inventory-alerts-all.csv"
+        : "inventory-alerts-today.csv";
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
