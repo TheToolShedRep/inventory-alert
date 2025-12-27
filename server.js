@@ -37,15 +37,15 @@ const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
 // ---- Clerk config ----
-// You MUST set these in Render env vars:
+// Required in Render env vars:
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY || "";
 const CLERK_PUBLISHABLE_KEY = process.env.CLERK_PUBLISHABLE_KEY || "";
 
-// This should be a FULL URL to Clerk hosted sign-in page, like:
+// FULL URL to Clerk hosted sign-in page, like:
 // https://ample-crow-22.accounts.dev/sign-in
 const CLERK_SIGN_IN_URL = process.env.CLERK_SIGN_IN_URL || "";
 
-// Optional: where to send users after they sign in (defaults to /checklist)
+// Optional: where to send users after sign-in
 const DEFAULT_AFTER_LOGIN = process.env.DEFAULT_AFTER_LOGIN || "/checklist";
 
 if (!CLERK_SECRET_KEY || !CLERK_PUBLISHABLE_KEY || !CLERK_SIGN_IN_URL) {
@@ -60,7 +60,7 @@ const lastAlertByKey = {}; // key: `${item}|${location}` → timestamp
 
 // ---------------- Express setup ----------------
 app.use(express.static(path.join(__dirname, "public")));
-app.use(express.urlencoded({ extended: true })); // for form POSTs (not used much now, but fine)
+app.use(express.urlencoded({ extended: true }));
 
 // ---------------- Utility Helpers ----------------
 function prettifyText(input = "") {
@@ -96,11 +96,27 @@ const clerkClient = createClerkClient({
 // Build a Web-standard Request from Express req so Clerk can authenticate it
 function toWebRequest(req) {
   const fullUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
-  // Express headers are already a plain object; Request can accept it
+
+  // IMPORTANT: use Headers() so Clerk receives a real Headers object
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    // Node can give string | string[]; Headers wants string
+    if (Array.isArray(v)) headers.set(k, v.join(","));
+    else if (typeof v === "string") headers.set(k, v);
+  }
+
   return new Request(fullUrl, {
     method: req.method,
-    headers: req.headers,
+    headers,
   });
+}
+
+// Helper: redirect to Clerk hosted sign-in with an absolute return URL
+function redirectToClerkSignIn(req, res) {
+  const returnTo = encodeURIComponent(
+    `${req.protocol}://${req.get("host")}${req.originalUrl}`
+  );
+  return res.redirect(`${CLERK_SIGN_IN_URL}?redirect_url=${returnTo}`);
 }
 
 // Middleware: require user to be signed in via Clerk
@@ -115,6 +131,8 @@ async function requireClerkAuth(req, res, next) {
     }
 
     const requestState = await clerkClient.authenticateRequest(toWebRequest(req), {
+      // ✅ PASS BOTH — this fixes a lot of “auth error” cases
+      secretKey: CLERK_SECRET_KEY,
       publishableKey: CLERK_PUBLISHABLE_KEY,
     });
 
@@ -122,45 +140,44 @@ async function requireClerkAuth(req, res, next) {
 
     // Not signed in → redirect to Clerk Hosted Sign-In
     if (!auth.userId) {
-      const returnTo = encodeURIComponent(
-        `${req.protocol}://${req.get("host")}${req.originalUrl}`
-      );
-
-      // Clerk hosted pages accept redirect_url
-      // Example: https://xxxx.accounts.dev/sign-in?redirect_url=https://yourapp.com/checklist
-      return res.redirect(`${CLERK_SIGN_IN_URL}?redirect_url=${returnTo}`);
+      return redirectToClerkSignIn(req, res);
     }
 
     // Attach auth to req for later if needed
     req.clerkAuth = auth;
     next();
   } catch (err) {
-    console.error("❌ Clerk auth error:", err);
-    return res.status(500).send("Auth error.");
+    // ✅ Do NOT 500 here unless you truly want a hard crash
+    // Most of the time this is simply “not signed in” / bad cookie / wrong keys
+    console.error("❌ Clerk authenticateRequest error:");
+    console.error(err?.stack || err);
+
+    // Safer UX: redirect to sign-in rather than throwing a 500 to the user
+    return redirectToClerkSignIn(req, res);
   }
 }
 
 // Home: send signed-in people to checklist; others to sign-in
 app.get("/", async (req, res) => {
-  // If Clerk isn’t configured, just show a basic message
   if (!CLERK_SECRET_KEY || !CLERK_PUBLISHABLE_KEY || !CLERK_SIGN_IN_URL) {
-    return res
-      .status(200)
-      .send("Server is running, but Clerk env vars are missing.");
+    return res.status(200).send("Server is running, but Clerk env vars are missing.");
   }
 
-  // Try authenticate silently; if not authed, go to sign-in
   try {
     const requestState = await clerkClient.authenticateRequest(toWebRequest(req), {
+      secretKey: CLERK_SECRET_KEY,
       publishableKey: CLERK_PUBLISHABLE_KEY,
     });
+
     const auth = requestState.toAuth();
+
     if (!auth.userId) {
       const returnTo = encodeURIComponent(
         `${req.protocol}://${req.get("host")}${DEFAULT_AFTER_LOGIN}`
       );
       return res.redirect(`${CLERK_SIGN_IN_URL}?redirect_url=${returnTo}`);
     }
+
     return res.redirect(DEFAULT_AFTER_LOGIN);
   } catch (e) {
     const returnTo = encodeURIComponent(
@@ -203,10 +220,7 @@ async function logAlertToSheet({ item, qty, location, ip, userAgent }) {
     if (!sheets) return;
 
     const timestamp = new Date().toISOString();
-
-    const values = [
-      [timestamp, item, qty, location || "", ip || "", userAgent || ""],
-    ];
+    const values = [[timestamp, item, qty, location || "", ip || "", userAgent || ""]];
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
@@ -238,18 +252,10 @@ async function getRecentAlertsFromSheet(limit = 50) {
 
     return recent
       .map((r) => {
-        const [
-          timestamp = "",
-          item = "",
-          qty = "",
-          location = "",
-          ip = "",
-          userAgent = "",
-        ] = r;
-
+        const [timestamp = "", item = "", qty = "", location = "", ip = "", userAgent = ""] = r;
         return { timestamp, item, qty, location, ip, userAgent };
       })
-      .reverse(); // latest first
+      .reverse();
   } catch (err) {
     console.error("❌ Error reading alerts from Google Sheets:", err.message);
     return [];
@@ -257,7 +263,6 @@ async function getRecentAlertsFromSheet(limit = 50) {
 }
 
 // ---------------- Inventory Alert Endpoint (staff QR) ----------------
-
 app.get("/alert", async (req, res) => {
   let { item = "unknown", qty = "unknown", location = "" } = req.query;
 
@@ -303,11 +308,9 @@ app.get("/alert", async (req, res) => {
       lastAlertByKey[key] = now;
     }
 
-    // 2) Log to sheet (always, even if push cooldown)
+    // 2) Log to sheet
     const ip =
-      (req.headers["x-forwarded-for"] || "")
-        .split(",")[0]
-        .trim() || req.ip || "";
+      (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "";
     const userAgent = req.headers["user-agent"] || "";
 
     await logAlertToSheet({
@@ -325,9 +328,7 @@ app.get("/alert", async (req, res) => {
     const statusDetail = isRateLimited
       ? "We’ve logged this again, but skipped another notification to avoid spam."
       : "Managers have been notified. Thank you!";
-    const locationLine = locationPretty
-      ? `<p><strong>Location:</strong> ${locationPretty}</p>`
-      : "";
+    const locationLine = locationPretty ? `<p><strong>Location:</strong> ${locationPretty}</p>` : "";
 
     res.send(`
       <!DOCTYPE html>
@@ -369,21 +370,17 @@ app.get("/alert", async (req, res) => {
 });
 
 // ---------------- Checklist (Protected by Clerk) ----------------
-
 app.get("/checklist", requireClerkAuth, async (req, res) => {
   try {
     let alerts = await getRecentAlertsFromSheet(200);
     const now = new Date();
 
-    // Today only
     alerts = alerts.filter((a) => isSameUTCDay(a.timestamp, now));
 
-    // low/out only
     const lowAlerts = alerts.filter((a) =>
       /(low|running|out|empty|critical)/i.test(a.qty || "")
     );
 
-    // Deduplicate by item + location
     const byKey = new Map();
     for (const a of lowAlerts) {
       const key = `${a.item || ""}|${a.location || ""}`;
@@ -448,10 +445,9 @@ app.get("/checklist", requireClerkAuth, async (req, res) => {
 });
 
 // ---------------- Manager View (Protected by Clerk) ----------------
-
 app.get("/manager", requireClerkAuth, async (req, res) => {
   try {
-    const rangeParam = (req.query.range || "today").toLowerCase(); // today | all
+    const rangeParam = (req.query.range || "today").toLowerCase();
     let alerts = await getRecentAlertsFromSheet(50);
     const now = new Date();
 
@@ -483,10 +479,8 @@ app.get("/manager", requireClerkAuth, async (req, res) => {
 
         const normalized = (qty || "").toLowerCase();
         let statusClass = "status-badge status-ok";
-        if (/(out|empty|critical)/.test(normalized))
-          statusClass = "status-badge status-danger";
-        else if (/(low|running)/.test(normalized))
-          statusClass = "status-badge status-warn";
+        if (/(out|empty|critical)/.test(normalized)) statusClass = "status-badge status-danger";
+        else if (/(low|running)/.test(normalized)) statusClass = "status-badge status-warn";
 
         return `
           <tr>
@@ -515,7 +509,7 @@ app.get("/manager", requireClerkAuth, async (req, res) => {
           p{ font-size:14px; color:#9ca3af; margin-top:0; margin-bottom:8px; }
           .top-bar{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
           .legend{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:11px; color:#9ca3af; margin-bottom:10px; }
-          .legend-label{ font-weight:600; margin-right:2px; }
+          .legend-label{ font-weight:700; margin-right:2px; }
           .btn{ display:inline-flex; align-items:center; justify-content:center; padding:6px 10px; border-radius:999px;
             font-size:11px; font-weight:800; border:1px solid #1f2937; background:#0b1120; color:#e5e7eb; text-decoration:none; }
           .btn:hover{ background:#111827; }
@@ -611,7 +605,6 @@ app.get("/manager", requireClerkAuth, async (req, res) => {
 });
 
 // ---------------- Manager CSV (Protected by Clerk) ----------------
-
 app.get("/manager.csv", requireClerkAuth, async (req, res) => {
   try {
     const rangeParam = (req.query.range || "today").toLowerCase();
@@ -643,9 +636,7 @@ app.get("/manager.csv", requireClerkAuth, async (req, res) => {
 
     const csvString = csv.join("\r\n");
     const filename =
-      rangeParam === "all"
-        ? "inventory-alerts-all.csv"
-        : "inventory-alerts-today.csv";
+      rangeParam === "all" ? "inventory-alerts-all.csv" : "inventory-alerts-today.csv";
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
